@@ -20,12 +20,14 @@ from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
 from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
-from ..utils.zep import (
-    call_zep_read_with_retry,
-    get_zep_client,
-    is_retryable_zep_error,
-    normalize_zep_search_query,
+from ..utils.graphiti_client import (
+    GRAPHITI_REQUEST_TIMEOUT_SECONDS,
+    call_graphiti_read_with_retry,
+    get_graphiti_client,
+    is_retryable_graphiti_error,
+    normalize_graphiti_search_query,
 )
+from ..utils.graphiti_runtime import run_async
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.oasis_profile')
@@ -260,16 +262,16 @@ class OasisProfileGenerator:
             base_url=self.base_url
         )
         
-        # Zep客户端用于检索丰富上下文
-        self.zep_api_key = zep_api_key or Config.ZEP_API_KEY
+        # Graphiti 客户端用于检索丰富上下文（字段名沿用 zep_client 以最小化改动）
+        self.zep_api_key = zep_api_key or Config.GRAPHITI_LLM_API_KEY
         self.zep_client = None
         self.graph_id = graph_id
-        
+
         if self.zep_api_key:
             try:
-                self.zep_client = get_zep_client(self.zep_api_key)
+                self.zep_client = get_graphiti_client(self.zep_api_key)
             except Exception as e:
-                logger.warning(f"Zep客户端初始化失败: {e}")
+                logger.warning(f"Graphiti 客户端初始化失败: {e}")
     
     def generate_profile_from_entity(
         self, 
@@ -376,65 +378,73 @@ class OasisProfileGenerator:
             logger.debug(f"跳过Zep检索：未设置graph_id")
             return results
         
-        comprehensive_query = normalize_zep_search_query(
+        comprehensive_query = normalize_graphiti_search_query(
             t('progress.zepSearchQuery', name=entity_name)
         )
-        
+
+        from graphiti_core.search.search_config_recipes import (
+            EDGE_HYBRID_SEARCH_RRF,
+            NODE_HYBRID_SEARCH_RRF,
+        )
+
         def search_edges():
             """搜索边（事实/关系）- 带重试机制"""
-            return call_zep_read_with_retry(
-                lambda: self.zep_client.graph.search(
+            config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
+            config.limit = 30
+            return call_graphiti_read_with_retry(
+                lambda: run_async(
+                    self.zep_client.search_(
                         query=comprehensive_query,
-                        graph_id=self.graph_id,
-                        limit=30,
-                        scope="edges",
-                        reranker="rrf"
+                        config=config,
+                        group_ids=[self.graph_id],
+                    ),
+                    timeout=GRAPHITI_REQUEST_TIMEOUT_SECONDS,
                 ),
                 operation_name=f"profile edge search ({entity.uuid})",
             )
-        
+
         def search_nodes():
             """搜索节点（实体摘要）- 带重试机制"""
-            return call_zep_read_with_retry(
-                lambda: self.zep_client.graph.search(
+            config = NODE_HYBRID_SEARCH_RRF.model_copy(deep=True)
+            config.limit = 20
+            return call_graphiti_read_with_retry(
+                lambda: run_async(
+                    self.zep_client.search_(
                         query=comprehensive_query,
-                        graph_id=self.graph_id,
-                        limit=20,
-                        scope="nodes",
-                        reranker="rrf"
+                        config=config,
+                        group_ids=[self.graph_id],
+                    ),
+                    timeout=GRAPHITI_REQUEST_TIMEOUT_SECONDS,
                 ),
                 operation_name=f"profile node search ({entity.uuid})",
             )
-        
+
         try:
-            # 并行执行edges和nodes搜索
+            # 并行执行edges和nodes搜索（两个线程各自 run_async 提交到共享 loop）
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 edge_future = executor.submit(search_edges)
                 node_future = executor.submit(search_nodes)
-                
-                # 获取结果
-                # Each request already has the configured HTTP timeout and
-                # typed retry budget. A second hard-coded 30s future timeout
-                # discarded late successes while the executor still waited.
+
                 edge_result = edge_future.result()
                 node_result = node_future.result()
-            
+
             # 处理边搜索结果
             all_facts = set()
-            if edge_result and hasattr(edge_result, 'edges') and edge_result.edges:
-                for edge in edge_result.edges:
-                    if hasattr(edge, 'fact') and edge.fact:
+            if edge_result:
+                for edge in getattr(edge_result, 'edges', None) or []:
+                    if getattr(edge, 'fact', None):
                         all_facts.add(edge.fact)
             results["facts"] = list(all_facts)
-            
+
             # 处理节点搜索结果
             all_summaries = set()
-            if node_result and hasattr(node_result, 'nodes') and node_result.nodes:
-                for node in node_result.nodes:
-                    if hasattr(node, 'summary') and node.summary:
+            if node_result:
+                for node in getattr(node_result, 'nodes', None) or []:
+                    if getattr(node, 'summary', None):
                         all_summaries.add(node.summary)
-                    if hasattr(node, 'name') and node.name and node.name != entity_name:
-                        all_summaries.add(f"相关实体: {node.name}")
+                    node_name = getattr(node, 'name', None)
+                    if node_name and node_name != entity_name:
+                        all_summaries.add(f"相关实体: {node_name}")
             results["node_summaries"] = list(all_summaries)
             
             # 构建综合上下文
@@ -448,8 +458,8 @@ class OasisProfileGenerator:
             logger.info(f"Zep混合检索完成: {entity_name}, 获取 {len(results['facts'])} 条事实, {len(results['node_summaries'])} 个相关节点")
             
         except Exception as e:
-            logger.warning(f"Zep检索失败 ({entity_name}): {e}")
-            if not is_retryable_zep_error(e):
+            logger.warning(f"Graphiti 检索失败 ({entity_name}): {e}")
+            if not is_retryable_graphiti_error(e):
                 raise
         
         return results

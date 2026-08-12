@@ -28,9 +28,20 @@ class Config:
     LLM_API_KEY = os.environ.get('LLM_API_KEY')
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
     LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
-    
-    # Zep配置
-    ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
+
+    # Graphiti 时序知识图谱配置（替代 Zep Cloud）
+    # 图谱数据存储在 Neo4j 5.26；Graphiti 复用上方 OpenAI 格式的 LLM 做实体/关系抽取
+    NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
+    NEO4J_USER = os.environ.get('NEO4J_USER', 'neo4j')
+    NEO4J_PASSWORD = os.environ.get('NEO4J_PASSWORD', 'mirofish')
+    # Graphiti 抽取用的 LLM；默认复用 MiroFish 主 LLM，如需独立模型可单独设置
+    GRAPHITI_LLM_API_KEY = os.environ.get('GRAPHITI_LLM_API_KEY') or os.environ.get('LLM_API_KEY')
+    GRAPHITI_LLM_BASE_URL = os.environ.get('GRAPHITI_LLM_BASE_URL') or os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
+    GRAPHITI_LLM_MODEL = os.environ.get('GRAPHITI_LLM_MODEL') or os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
+    GRAPHITI_EMBEDDER_MODEL = os.environ.get('GRAPHITI_EMBEDDER_MODEL', 'text-embedding-3-small')
+    # 请求/摄入超时（秒）：分别对应单次图查询与整批 episode 摄入等待
+    GRAPHITI_REQUEST_TIMEOUT_SECONDS = float(os.environ.get('GRAPHITI_REQUEST_TIMEOUT_SECONDS', '60'))
+    GRAPHITI_INGESTION_WAIT_TIMEOUT_SECONDS = int(os.environ.get('GRAPHITI_INGESTION_WAIT_TIMEOUT_SECONDS', '600'))
     
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
@@ -66,10 +77,10 @@ class Config:
         errors: list[str] = []
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY 未配置")
-        if os.environ.get("ZEP_API_URL"):
-            errors.append("ZEP_API_URL 不受支持；MiroFish 仅连接 Zep Cloud")
+        if not cls.NEO4J_URI:
+            errors.append("NEO4J_URI 未配置")
+        if not cls.GRAPHITI_LLM_API_KEY:
+            errors.append("GRAPHITI_LLM_API_KEY 未配置（可复用 LLM_API_KEY）")
         if cls.DEBUG:
             import warnings
             warnings.warn("Flask DEBUG mode is enabled. Do not use in production.", RuntimeWarning)

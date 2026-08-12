@@ -12,19 +12,21 @@ import time
 import json
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
-from zep_cloud import NotFoundError
 
 from ..config import Config
+from ..exceptions import GraphNotFound
 from ..utils.logger import get_logger
 from ..utils.llm_client import LLMClient
 from ..utils.locale import get_locale, t
-from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
-from ..utils.zep import (
-    call_zep_read_with_retry,
-    get_zep_client,
-    normalize_zep_search_limit,
-    normalize_zep_search_query,
+from ..utils.graphiti_paging import fetch_all_nodes, fetch_all_edges
+from ..utils.graphiti_client import (
+    GRAPHITI_REQUEST_TIMEOUT_SECONDS,
+    call_graphiti_read_with_retry,
+    get_graphiti_client,
+    normalize_graphiti_search_limit,
+    normalize_graphiti_search_query,
 )
+from ..utils.graphiti_runtime import run_async
 
 logger = get_logger('mirofish.zep_tools')
 
@@ -428,26 +430,26 @@ class ZepToolsService:
     RETRY_DELAY = 2.0
     
     def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
-        self.api_key = api_key or Config.ZEP_API_KEY
+        self.api_key = api_key or Config.GRAPHITI_LLM_API_KEY
         if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = get_zep_client(self.api_key)
+            raise ValueError("GRAPHITI_LLM_API_KEY 未配置（可复用 LLM_API_KEY）")
+
+        self.client = get_graphiti_client(self.api_key)
         # LLM客户端用于InsightForge生成子问题
         self._llm_client = llm_client
         logger.info(t("console.zepToolsInitialized"))
-    
+
     @property
     def llm(self) -> LLMClient:
         """延迟初始化LLM客户端"""
         if self._llm_client is None:
             self._llm_client = LLMClient()
         return self._llm_client
-    
-    def _call_with_retry(self, func, operation_name: str, max_retries: int = None):
-        """Retry one safe read using typed Zep/HTTPX error classification."""
 
-        return call_zep_read_with_retry(
+    def _call_with_retry(self, func, operation_name: str, max_retries: int = None):
+        """Retry one safe read using typed Graphiti/Neo4j error classification."""
+
+        return call_graphiti_read_with_retry(
             func,
             operation_name=operation_name,
             max_attempts=max_retries or self.MAX_RETRIES,
@@ -477,51 +479,70 @@ class ZepToolsService:
             SearchResult: 搜索结果
         """
         logger.info(t("console.graphSearch", graphId=graph_id, query=query[:50]))
-        
-        zep_query = normalize_zep_search_query(query)
-        zep_limit = normalize_zep_search_limit(limit)
+
+        g_query = normalize_graphiti_search_query(query)
+        g_limit = normalize_graphiti_search_limit(limit)
 
         try:
+            # Graphiti 的 search_ 返回完整 SearchResults（含 nodes/edges/episodes）。
+            # 用 deep copy 的预设配置避免污染模块级单例；按 scope 选主搜索对象。
+            from graphiti_core.search.search_config_recipes import (
+                COMBINED_HYBRID_SEARCH_CROSS_ENCODER,
+                EDGE_HYBRID_SEARCH_CROSS_ENCODER,
+                NODE_HYBRID_SEARCH_RRF,
+            )
+
+            if scope == "nodes":
+                base_config = NODE_HYBRID_SEARCH_RRF
+            else:
+                # "edges" / "both"：默认边检索（cross_encoder，更深的事实召回）
+                base_config = EDGE_HYBRID_SEARCH_CROSS_ENCODER
+            search_config = base_config.model_copy(deep=True)
+            search_config.limit = g_limit
+
             search_results = self._call_with_retry(
-                func=lambda: self.client.graph.search(
-                    graph_id=graph_id,
-                    query=zep_query,
-                    limit=zep_limit,
-                    scope=scope,
-                    reranker="cross_encoder"
+                func=lambda: run_async(
+                    self.client.search_(
+                        query=g_query,
+                        config=search_config,
+                        group_ids=[graph_id],
+                    ),
+                    timeout=GRAPHITI_REQUEST_TIMEOUT_SECONDS,
                 ),
                 operation_name=t("console.graphSearchOp", graphId=graph_id)
             )
-            
+
             facts = []
             edges = []
             nodes = []
-            
+
             # 解析边搜索结果
-            if hasattr(search_results, 'edges') and search_results.edges:
-                for edge in search_results.edges:
-                    if hasattr(edge, 'fact') and edge.fact:
-                        facts.append(edge.fact)
-                    edges.append({
-                        "uuid": getattr(edge, 'uuid_', None) or getattr(edge, 'uuid', ''),
-                        "name": getattr(edge, 'name', ''),
-                        "fact": getattr(edge, 'fact', ''),
-                        "source_node_uuid": getattr(edge, 'source_node_uuid', ''),
-                        "target_node_uuid": getattr(edge, 'target_node_uuid', ''),
-                    })
-            
+            result_edges = getattr(search_results, 'edges', None) or []
+            for edge in result_edges:
+                if hasattr(edge, 'fact') and edge.fact:
+                    facts.append(edge.fact)
+                edges.append({
+                    "uuid": getattr(edge, 'uuid', None) or getattr(edge, 'uuid_', '') or "",
+                    "name": getattr(edge, 'name', '') or "",
+                    "fact": getattr(edge, 'fact', '') or "",
+                    "source_node_uuid": getattr(edge, 'source_node_uuid', '') or "",
+                    "target_node_uuid": getattr(edge, 'target_node_uuid', '') or "",
+                })
+
             # 解析节点搜索结果
-            if hasattr(search_results, 'nodes') and search_results.nodes:
-                for node in search_results.nodes:
-                    nodes.append({
-                        "uuid": getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
-                        "name": getattr(node, 'name', ''),
-                        "labels": getattr(node, 'labels', []),
-                        "summary": getattr(node, 'summary', ''),
-                    })
-                    # 节点摘要也算作事实
-                    if hasattr(node, 'summary') and node.summary:
-                        facts.append(f"[{node.name}]: {node.summary}")
+            result_nodes = getattr(search_results, 'nodes', None) or []
+            for node in result_nodes:
+                node_uuid = getattr(node, 'uuid', None) or getattr(node, 'uuid_', '') or ""
+                nodes.append({
+                    "uuid": node_uuid,
+                    "name": getattr(node, 'name', '') or "",
+                    "labels": getattr(node, 'labels', []) or [],
+                    "summary": getattr(node, 'summary', '') or "",
+                })
+                # 节点摘要也算作事实
+                node_summary = getattr(node, 'summary', None)
+                if node_summary:
+                    facts.append(f"[{getattr(node, 'name', '')}]: {node_summary}")
             
             logger.info(t("console.searchComplete", count=len(facts)))
             
@@ -659,13 +680,13 @@ class ZepToolsService:
 
         result = []
         for node in nodes:
-            node_uuid = getattr(node, 'uuid_', None) or getattr(node, 'uuid', None) or ""
+            node_uuid = getattr(node, 'uuid', None) or getattr(node, 'uuid_', None) or ""
             result.append(NodeInfo(
                 uuid=str(node_uuid) if node_uuid else "",
-                name=node.name or "",
-                labels=node.labels or [],
-                summary=node.summary or "",
-                attributes=node.attributes or {}
+                name=getattr(node, 'name', '') or "",
+                labels=getattr(node, 'labels', []) or [],
+                summary=getattr(node, 'summary', '') or "",
+                attributes=getattr(node, 'attributes', {}) or {}
             ))
 
         logger.info(t("console.fetchedNodes", count=len(result)))
@@ -688,13 +709,13 @@ class ZepToolsService:
 
         result = []
         for edge in edges:
-            edge_uuid = getattr(edge, 'uuid_', None) or getattr(edge, 'uuid', None) or ""
+            edge_uuid = getattr(edge, 'uuid', None) or getattr(edge, 'uuid_', None) or ""
             edge_info = EdgeInfo(
                 uuid=str(edge_uuid) if edge_uuid else "",
-                name=edge.name or "",
-                fact=edge.fact or "",
-                source_node_uuid=edge.source_node_uuid or "",
-                target_node_uuid=edge.target_node_uuid or ""
+                name=getattr(edge, 'name', '') or "",
+                fact=getattr(edge, 'fact', '') or "",
+                source_node_uuid=getattr(edge, 'source_node_uuid', '') or "",
+                target_node_uuid=getattr(edge, 'target_node_uuid', '') or ""
             )
 
             # 添加时间信息
@@ -723,21 +744,24 @@ class ZepToolsService:
         
         try:
             node = self._call_with_retry(
-                func=lambda: self.client.graph.node.get(uuid_=node_uuid),
+                func=lambda: run_async(
+                    self.client.nodes.entity.get_by_uuid(uuid=node_uuid),
+                    timeout=GRAPHITI_REQUEST_TIMEOUT_SECONDS,
+                ),
                 operation_name=t("console.fetchNodeDetailOp", uuid=node_uuid[:8])
             )
-            
+
             if not node:
                 return None
-            
+
             return NodeInfo(
-                uuid=getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
-                name=node.name or "",
-                labels=node.labels or [],
-                summary=node.summary or "",
-                attributes=node.attributes or {}
+                uuid=getattr(node, 'uuid', None) or getattr(node, 'uuid_', '') or "",
+                name=getattr(node, 'name', '') or "",
+                labels=getattr(node, 'labels', []) or [],
+                summary=getattr(node, 'summary', '') or "",
+                attributes=getattr(node, 'attributes', {}) or {}
             )
-        except NotFoundError:
+        except GraphNotFound:
             return None
         except Exception as e:
             logger.error(t("console.fetchNodeDetailFailed", error=str(e)))
