@@ -1,3 +1,11 @@
+"""本体归一化与 Graphiti 类型构造测试（替代原 Zep set_ontology 契约测试）。
+
+Graphiti 无 ``set_ontology`` 调用——自定义类型在 ``add_episode`` 时 per-call
+传入。``GraphBuilderService.set_ontology`` 现在只做本体构造并缓存到实例，
+``_build_ontology_types`` 是真正的被测单元，产出 Graphiti 所需的
+``entity_types`` / ``edge_types`` / ``edge_type_map`` 三元组。
+"""
+
 from app.services.ontology_generator import OntologyGenerator
 from app.services.graph_builder import GraphBuilderService
 from app.utils.ontology import (
@@ -5,10 +13,6 @@ from app.utils.ontology import (
     MAX_ONTOLOGY_SOURCE_TARGETS,
     normalize_ontology_attribute,
     normalize_ontology_attributes,
-)
-from zep_cloud.external_clients.ontology import (
-    edge_model_to_api_schema,
-    entity_model_to_api_schema,
 )
 
 
@@ -31,7 +35,7 @@ def test_reject_unusable_attribute_shapes():
         assert normalize_ontology_attribute(value) is None
 
 
-def test_attribute_list_is_non_empty_and_capped_for_zep():
+def test_attribute_list_is_non_empty_and_capped():
     assert normalize_ontology_attributes(None) == [{
         "name": "details",
         "type": "text",
@@ -75,19 +79,15 @@ def test_generator_adds_a_property_to_empty_custom_types():
     assert result["edge_types"][0]["attributes"][0]["name"] == "details"
 
 
-def test_graph_builder_safety_net_accepts_strings_and_skips_invalid_values():
-    captured = {}
-
-    class GraphApi:
-        def set_ontology(self, **kwargs):
-            captured.update(kwargs)
-
-    class Client:
-        graph = GraphApi()
-
+def _build(ontology):
+    """用 GraphBuilderService 实例构造本体三元组（不触碰 SDK）。"""
     builder = object.__new__(GraphBuilderService)
-    builder.client = Client()
-    builder.set_ontology("graph-id", {
+    builder.set_ontology("graph-id", ontology)
+    return builder._build_ontology_types(ontology)
+
+
+def test_build_types_renames_reserved_attribute_names():
+    entity_types, _, _ = _build({
         "entity_types": [{
             "name": "Speaker",
             "attributes": ["role", None, {"name": "summary"}],
@@ -95,29 +95,29 @@ def test_graph_builder_safety_net_accepts_strings_and_skips_invalid_values():
         "edge_types": [],
     })
 
-    speaker = captured["entities"]["Speaker"]
-    assert set(speaker.__annotations__) == {"role", "entity_summary"}
+    speaker = entity_types["Speaker"]
+    # "summary" 是保留名，应被重命名为 "entity_summary"
+    assert set(speaker.model_fields) == {"role", "entity_summary"}
 
 
-def test_graph_builder_emits_a_pinned_zep_sdk_compatible_schema():
-    captured = {}
-
-    class GraphApi:
-        def set_ontology(self, **kwargs):
-            captured.update(kwargs)
-
-    class Client:
-        graph = GraphApi()
-
-    builder = object.__new__(GraphBuilderService)
-    builder.client = Client()
-    builder.set_ontology("graph-id", {
+def test_build_types_caps_attributes_at_max():
+    entity_types, _, _ = _build({
         "entity_types": [{
             "name": "Speaker",
-            "attributes": ["graph_id"] + [
-                f"field_{index}" for index in range(10)
-            ],
+            "attributes": ["graph_id"] + [f"field_{i}" for i in range(10)],
         }],
+        "edge_types": [],
+    })
+
+    speaker = entity_types["Speaker"]
+    # graph_id 被重命名为 entity_graph_id；属性上限 MAX_ONTOLOGY_ATTRIBUTES
+    assert "entity_graph_id" in speaker.model_fields
+    assert len(speaker.model_fields) == MAX_ONTOLOGY_ATTRIBUTES
+
+
+def test_build_types_constructs_edge_type_and_source_target_map():
+    _, edge_types, edge_type_map = _build({
+        "entity_types": [],
         "edge_types": [{
             "name": "MENTIONS",
             "attributes": [],
@@ -125,41 +125,13 @@ def test_graph_builder_emits_a_pinned_zep_sdk_compatible_schema():
         }],
     })
 
-    assert captured["graph_ids"] == ["graph-id"]
-
-    speaker = captured["entities"]["Speaker"]
-    entity_schema = entity_model_to_api_schema(speaker, "Speaker")
-    assert len(entity_schema["properties"]) == MAX_ONTOLOGY_ATTRIBUTES
-    assert entity_schema["properties"][0] == {
-        "name": "entity_graph_id",
-        "type": "Text",
-        "description": "graph_id",
-    }
-
-    mentions, source_targets = captured["edges"]["MENTIONS"]
-    edge_schema = edge_model_to_api_schema(mentions, "MENTIONS")
-    assert edge_schema["properties"] == [{
-        "name": "details",
-        "type": "Text",
-        "description": "Additional details about this ontology type.",
-    }]
-    assert source_targets[0].source == "Speaker"
-    assert source_targets[0].target == "Speaker"
+    assert "MENTIONS" in edge_types
+    # edge_type_map 按 (source, target) 聚合
+    assert edge_type_map[("Speaker", "Speaker")] == ["MENTIONS"]
 
 
-def test_graph_builder_passes_an_empty_entity_mapping_for_edge_only_ontology():
-    captured = {}
-
-    class GraphApi:
-        def set_ontology(self, **kwargs):
-            captured.update(kwargs)
-
-    class Client:
-        graph = GraphApi()
-
-    builder = object.__new__(GraphBuilderService)
-    builder.client = Client()
-    builder.set_ontology("graph-id", {
+def test_build_types_handles_edge_only_ontology():
+    entity_types, edge_types, edge_type_map = _build({
         "entity_types": [],
         "edge_types": [{
             "name": "RELATED_TO",
@@ -168,28 +140,19 @@ def test_graph_builder_passes_an_empty_entity_mapping_for_edge_only_ontology():
         }],
     })
 
-    assert captured["entities"] == {}
+    assert entity_types == {}
+    assert "RELATED_TO" in edge_types
+    assert edge_type_map[("Entity", "Entity")] == ["RELATED_TO"]
 
 
-def test_graph_builder_deduplicates_and_caps_edge_source_targets_for_zep():
-    captured = {}
-
-    class GraphApi:
-        def set_ontology(self, **kwargs):
-            captured.update(kwargs)
-
-    class Client:
-        graph = GraphApi()
-
+def test_build_types_deduplicates_and_caps_edge_source_targets():
     source_targets = [
         {"source": f"Source{index}", "target": f"Target{index}"}
         for index in range(MAX_ONTOLOGY_SOURCE_TARGETS + 2)
     ]
-    source_targets.insert(1, dict(source_targets[0]))
+    source_targets.insert(1, dict(source_targets[0]))  # 重复对
 
-    builder = object.__new__(GraphBuilderService)
-    builder.client = Client()
-    builder.set_ontology("graph-id", {
+    _, _, edge_type_map = _build({
         "entity_types": [],
         "edge_types": [{
             "name": "RELATED_TO",
@@ -198,12 +161,13 @@ def test_graph_builder_deduplicates_and_caps_edge_source_targets_for_zep():
         }],
     })
 
-    _, normalized_targets = captured["edges"]["RELATED_TO"]
-    assert len(normalized_targets) == MAX_ONTOLOGY_SOURCE_TARGETS
-    assert [(item.source, item.target) for item in normalized_targets] == [
-        (f"Source{index}", f"Target{index}")
-        for index in range(MAX_ONTOLOGY_SOURCE_TARGETS)
-    ]
+    # edge_type_map 按 (source,target) 聚合，重复对自然去重
+    pairs = list(edge_type_map.keys())
+    assert len(pairs) == MAX_ONTOLOGY_SOURCE_TARGETS
+    assert pairs[0] == ("Source0", "Target0")
+    # 同一 (source,target) 的边类型列表应只有一个 RELATED_TO
+    for pair in pairs:
+        assert edge_type_map[pair] == ["RELATED_TO"]
 
 
 def test_generator_ignores_invalid_entries_and_normalizes_edge_names():

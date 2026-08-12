@@ -12,3 +12,23 @@ services:
     restart: unless-stopped
     volumes:
       - ./backend/uploads:/app/backend/uploads
+    depends_on:
+      - neo4j
+
+  # Graphiti 的时序知识图谱后端（替代 Zep Cloud）
+  neo4j:
+    image: neo4j:5.26
+    container_name: mirofish-neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/mirofish
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_memory_heap_max__size=1G
+    ports:
+      - "7687:7687"
+      - "7474:7474"
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:

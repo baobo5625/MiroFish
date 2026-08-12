@@ -47,7 +47,7 @@ def test_project_reset_deletes_the_cloud_graph_before_clearing_reference(monkeyp
             events.append(("cloud-delete", graph_id))
 
     monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
-    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api.Config, "GRAPHITI_LLM_API_KEY", "test-key")
     monkeypatch.setattr(
         graph_api.ProjectManager,
         "get_project",
@@ -72,7 +72,7 @@ def test_project_reset_deletes_the_cloud_graph_before_clearing_reference(monkeyp
 
 def test_project_reset_refuses_a_graph_with_an_active_simulation(monkeypatch):
     project = _project(ProjectStatus.GRAPH_COMPLETED)
-    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api.Config, "GRAPHITI_LLM_API_KEY", "test-key")
     monkeypatch.setattr(
         graph_api.ProjectManager,
         "get_project",
@@ -118,7 +118,7 @@ def test_graph_delete_cannot_discard_an_updater_during_finalization(monkeypatch)
 
 def test_repeated_build_request_reuses_the_existing_task(monkeypatch):
     project = _project(ProjectStatus.GRAPH_BUILDING)
-    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api.Config, "GRAPHITI_LLM_API_KEY", "test-key")
     monkeypatch.setattr(
         graph_api.ProjectManager,
         "get_project",
@@ -152,7 +152,7 @@ def test_stale_build_after_restart_is_recoverable_instead_of_reused(monkeypatch)
     project.zep_batch_id = None
     project.zep_batch_operation_id = None
     saved = []
-    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api.Config, "GRAPHITI_LLM_API_KEY", "test-key")
     monkeypatch.setattr(
         graph_api.ProjectManager,
         "get_project",
@@ -209,7 +209,7 @@ def test_stale_build_resumes_a_persisted_processing_batch(monkeypatch):
         def start(self):
             pass
 
-    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api.Config, "GRAPHITI_LLM_API_KEY", "test-key")
     monkeypatch.setattr(graph_api, "TaskManager", Tasks)
     monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
     monkeypatch.setattr(graph_api.threading, "Thread", Thread)
@@ -256,7 +256,7 @@ def test_project_delete_removes_cloud_graph_before_local_files(monkeypatch):
             events.append(("cloud-delete", graph_id))
 
     monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
-    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api.Config, "GRAPHITI_LLM_API_KEY", "test-key")
     monkeypatch.setattr(
         graph_api.ProjectManager,
         "get_project",
@@ -287,7 +287,7 @@ def test_project_delete_removes_cloud_graph_before_local_files(monkeypatch):
 
 def test_completed_build_request_is_idempotent_without_force(monkeypatch):
     project = _project(ProjectStatus.GRAPH_COMPLETED)
-    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api.Config, "GRAPHITI_LLM_API_KEY", "test-key")
     monkeypatch.setattr(
         graph_api.ProjectManager,
         "get_project",
@@ -309,7 +309,7 @@ def test_completed_build_request_is_idempotent_without_force(monkeypatch):
 
 def test_force_must_be_a_json_boolean(monkeypatch):
     project = _project(ProjectStatus.GRAPH_COMPLETED)
-    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api.Config, "GRAPHITI_LLM_API_KEY", "test-key")
     monkeypatch.setattr(
         graph_api.ProjectManager,
         "get_project",
@@ -356,7 +356,7 @@ def test_graph_reset_and_memory_start_cannot_cross_between_delete_and_clear(
             return simulation
 
     monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
-    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api.Config, "GRAPHITI_LLM_API_KEY", "test-key")
     monkeypatch.setattr(
         graph_api.ProjectManager,
         "get_project",
