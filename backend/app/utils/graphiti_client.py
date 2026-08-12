@@ -96,9 +96,7 @@ def _cached_graphiti_client(
     from graphiti_core.cross_encoder.openai_reranker_client import (
         OpenAIRerankerClient,
     )
-    from graphiti_core.llm_client import LLMConfig
-    from graphiti_core.llm_client.azure_openai_client import AzureOpenAILLMClient
-    from openai import AsyncOpenAI
+    from graphiti_core.llm_client import LLMConfig, OpenAIClient
 
     driver = Neo4jDriver(uri=uri, user=user, password=password)
     # OpenAI SDK 的 responses/embeddings 端点要求 base_url 含 /v1，否则会拼成
@@ -115,14 +113,12 @@ def _cached_graphiti_client(
         small_model=llm_model,
         base_url=normalized_base_url,
     )
-    # 用 AzureOpenAILLMClient 而非 OpenAIClient：
-    # OpenAIClient 一律用 responses.parse（OpenAI Responses API），但红杉网关
-    # 对 responses.parse 的 structured output 支持有缺陷（output_text 混入
-    # input_schema 噪声）。AzureOpenAILLMClient 对非 reasoning 模型
-    # （deepseek-v4-flash 不是 reasoning 模型）走 beta.chat.completions.parse
-    # （/v1/chat/completions 的 response_format），红杉网关完全支持。
-    async_openai = AsyncOpenAI(api_key=llm_api_key, base_url=normalized_base_url)
-    llm_client = AzureOpenAILLMClient(azure_client=async_openai, config=llm_config)
+    # 用 OpenAIClient（走 OpenAI Responses API / responses.parse）。
+    # 自建网关对 responses.parse 的 structured output 支持可能不完整：
+    # output_text 会把 JSON Schema（input_schema 字段）与数据混在一起返回，
+    # 甚至有时只返回 schema 不返回数据。靠 _install_responses_cleanup_patch
+    # 清洗噪声 + 增强 MAX_RETRIES 重试处理。
+    llm_client = OpenAIClient(config=llm_config)
     embedder = OpenAIEmbedder(
         config=OpenAIEmbedderConfig(
             api_key=llm_api_key,
@@ -143,99 +139,115 @@ def _cached_graphiti_client(
         cross_encoder=cross_encoder,
         graph_driver=driver,
     )
-    _install_azure_tuple_patch()
+    _install_responses_cleanup_patch()
     return graphiti
 
 
-def _install_azure_tuple_patch() -> None:
-    """修正 AzureOpenAILLMClient._handle_structured_response：清洗网关噪声 + 补三元组。
+def _install_responses_cleanup_patch() -> None:
+    """清洗自建网关 responses 返回的 input_schema 噪声 + 增强 retry。
 
-    解决两个问题：
-    1. **input_schema 噪声**：红杉网关的 structured output 响应会把 JSON Schema
-       （``input_schema`` 字段）与数据混在同一对象里返回，甚至有时只返回 schema
-       不返回数据。原实现 ``json.loads(output_text)`` 后直接返回，graphiti 上层
-       ``ExtractedEdges(**dict)`` 因缺 ``edges`` 字段而 ValidationError。这里在
-       解析后剔除 ``input_schema``/``schema``/``json_schema`` 等噪声键。
-    2. **三元组返回**：graphiti ``_generate_response`` 期望
-       ``_handle_structured_response`` 返回 ``(dict, input_tokens, output_tokens)``，
-       但 AzureOpenAILLMClient 只返回 ``dict``，导致 ``expected 3, got 1``。
+    问题：某些自建 OpenAI 兼容网关（如红杉 ai-gateway）对 Responses API 的
+    structured output 实现有缺陷——返回的 ``output_text`` 把 JSON Schema
+    （``input_schema`` 字段）与数据混在同一对象里，甚至有时只返回 schema
+    不返回数据。openai SDK 的 ``responses.parse`` 内部用
+    ``model_validate_json`` 验证，遇噪声直接抛 ValidationError 且异常里丢失
+    response 对象，无法恢复。
+
+    修复：patch ``OpenAIClient._create_structured_completion``，改用
+    ``responses.create`` + ``text.format=json_schema``（不走 SDK 的
+    post_parser 验证，返回 response 对象），自己 ``json.loads(output_text)``
+    并剔除 ``input_schema``/``schema``/``json_schema`` 等噪声键，再包装成
+    graphiti ``_handle_structured_response`` 期望的形状。网关偶发"只返回
+    schema 无数据"的坏响应靠增强的 MAX_RETRIES=4 重试覆盖。
     """
     try:
-        from graphiti_core.llm_client.azure_openai_client import AzureOpenAILLMClient
+        from graphiti_core.llm_client.openai_client import OpenAIClient
     except Exception:  # pragma: no cover
         return
 
-    if getattr(AzureOpenAILLMClient, "_mirofish_tuple_patched", False):
+    if getattr(OpenAIClient, "_mirofish_cleanup_patched", False):
         return
 
-    original = AzureOpenAILLMClient._handle_structured_response
-
-    def _clean_data(data):
-        """剔除网关混入的 schema 噪声字段，只留数据。"""
-        if isinstance(data, dict):
-            for noise_key in ("input_schema", "schema", "json_schema"):
-                data.pop(noise_key, None)
-        return data
-
-    def _usage_tokens(response):
-        usage = getattr(response, "usage", None)
-        if not usage:
-            return 0, 0
-        i = getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0
-        o = getattr(usage, "output_tokens", 0) or getattr(usage, "completion_tokens", 0) or 0
-        return i, o
-
-    def _patched_handle(self, response):
+    async def _patched_create_structured_completion(
+        self, model, messages, temperature, max_tokens, response_model,
+        reasoning=None, verbosity=None,
+    ):
         import json as _json
+        from types import SimpleNamespace
 
-        # 路径 B：chat.completions.parse 返回 ParsedChatCompletion
-        if hasattr(response, "choices") and response.choices:
-            msg = response.choices[0].message
-            # 优先用已解析的 pydantic 对象
-            parsed = getattr(msg, "parsed", None)
-            if parsed is not None:
-                data = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
-                i, o = _usage_tokens(response)
-                return _clean_data(data), i, o
-            # 回退：从 content 文本解析并清洗（网关噪声最可能出现在这里）
-            content = getattr(msg, "content", None)
-            if content:
-                try:
-                    data = _json.loads(content)
-                    i, o = _usage_tokens(response)
-                    return _clean_data(data), i, o
-                except _json.JSONDecodeError:
-                    pass
-            if getattr(msg, "refusal", None):
-                from graphiti_core.llm_client.errors import RefusalError
-                raise RefusalError(msg.refusal)
-            raise Exception(f"Invalid response from LLM: {response.model_dump()}")
+        is_reasoning_model = (
+            model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
+        )
+        # 用 model_json_schema 构造 json_schema，走 responses.create 的 text.format
+        # （不走 responses.parse 的 post_parser，返回的 response 对象可用）
+        try:
+            schema = response_model.model_json_schema()
+        except Exception:
+            schema = {"type": "object"}
 
-        # 路径 A：responses.parse 返回 ParsedResponse（用 output_text）
-        if hasattr(response, "output_text"):
-            text = response.output_text
-            if text:
-                try:
-                    data = _json.loads(text)
-                    i, o = _usage_tokens(response)
-                    return _clean_data(data), i, o
-                except _json.JSONDecodeError:
-                    # 回退到原实现（纯文本响应等）
-                    return original(self, response)
-            if getattr(response, "refusal", None):
-                from graphiti_core.llm_client.errors import RefusalError
-                raise RefusalError(response.refusal)
+        request_kwargs = {
+            "model": model,
+            "input": messages,
+            "max_output_tokens": max_tokens,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": getattr(response_model, "__name__", "Response"),
+                        "schema": schema,
+                        "strict": False,
+                    },
+                }
+            },
+        }
+        if temperature is not None and not is_reasoning_model:
+            request_kwargs["temperature"] = temperature
 
-        # 其他情况回退原实现
-        return original(self, response)
+        raw = await self.client.responses.create(**request_kwargs)
+        text = getattr(raw, "output_text", None) or ""
 
-    AzureOpenAILLMClient._handle_structured_response = _patched_handle
-    AzureOpenAILLMClient._mirofish_tuple_patched = True
+        # 清洗网关噪声：剔除 input_schema 等 schema 字段，只留数据
+        cleaned = None
+        if text:
+            try:
+                data = _json.loads(text)
+                if isinstance(data, dict):
+                    for noise_key in ("input_schema", "schema", "json_schema"):
+                        data.pop(noise_key, None)
+                cleaned = data
+            except _json.JSONDecodeError:
+                pass
+
+        # 包装成 graphiti _handle_structured_response 期望的 response 形状：
+        # output_text（清洗后的纯数据 JSON）+ usage
+        cleaned_text = _json.dumps(cleaned) if cleaned is not None else ""
+
+        # 数据完整性校验：网关偶发只返回 schema 不返回数据，清洗后 dict 可能
+        # 缺 response_model 的必填字段。此时抛异常让 generate_response 重试。
+        if cleaned is not None:
+            try:
+                response_model.model_validate(cleaned)
+            except Exception as ve:
+                raise Exception(
+                    f"网关返回数据不完整（清洗后缺字段），触发重试: {ve}"
+                ) from ve
+
+        usage = getattr(raw, "usage", None)
+        return SimpleNamespace(
+            output_text=cleaned_text,
+            usage=usage,
+            refusal=getattr(raw, "refusal", None),
+        )
+
+    OpenAIClient._create_structured_completion = _patched_create_structured_completion
+    OpenAIClient._mirofish_cleanup_patched = True
 
     # 增强 LLM 抽取重试：网关偶发返回坏格式（清洗后仍可能缺数据字段），
-    # graphiti 默认 MAX_RETRIES=2 偶尔不够。提到 4，配合清洗让成功率从 ~80% 升至 ~99%。
+    # graphiti 默认 MAX_RETRIES=2 不够。提到 6（单次成功率 ~80% 时，
+    # 6 次重试后失败率约 0.0064%）。
     try:
-        AzureOpenAILLMClient.MAX_RETRIES = 4
+        from graphiti_core.llm_client.openai_base_client import BaseOpenAIClient
+        BaseOpenAIClient.MAX_RETRIES = 6
     except Exception:  # pragma: no cover
         pass
 
