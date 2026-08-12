@@ -144,21 +144,19 @@ def _cached_graphiti_client(
 
 
 def _install_responses_cleanup_patch() -> None:
-    """清洗自建网关 responses 返回的 input_schema 噪声 + 增强 retry。
+    """网关 responses.parse 兼容：优先原生 parse，失败回退 create+清洗。
 
-    问题：某些自建 OpenAI 兼容网关（如红杉 ai-gateway）对 Responses API 的
-    structured output 实现有缺陷——返回的 ``output_text`` 把 JSON Schema
-    （``input_schema`` 字段）与数据混在同一对象里，甚至有时只返回 schema
-    不返回数据。openai SDK 的 ``responses.parse`` 内部用
-    ``model_validate_json`` 验证，遇噪声直接抛 ValidationError 且异常里丢失
-    response 对象，无法恢复。
+    策略：优先用 openai SDK 原生 ``responses.parse``（``text_format``，SDK
+    内部做 pydantic 验证）——网关支持良好时（如红杉 dev 网关 5/5 成功）这是
+    最干净的路径。
 
-    修复：patch ``OpenAIClient._create_structured_completion``，改用
-    ``responses.create`` + ``text.format=json_schema``（不走 SDK 的
-    post_parser 验证，返回 response 对象），自己 ``json.loads(output_text)``
-    并剔除 ``input_schema``/``schema``/``json_schema`` 等噪声键，再包装成
-    graphiti ``_handle_structured_response`` 期望的形状。网关偶发"只返回
-    schema 无数据"的坏响应靠增强的 MAX_RETRIES=4 重试覆盖。
+    当 ``responses.parse`` 抛 ValidationError（网关返回的 output_text 混入
+    ``input_schema`` 噪声或只返回 schema 不返回数据）时，回退到
+    ``responses.create`` + ``text.format=json_schema``（不走 SDK post_parser，
+    保留 response 对象），自己 ``json.loads(output_text)`` 并剔除噪声键，
+    再做数据完整性校验，缺字段时抛异常触发 graphiti 重试。
+
+    MAX_RETRIES 从默认 2 提到 6，增加撞上完整响应的概率。
     """
     try:
         from graphiti_core.llm_client.openai_client import OpenAIClient
@@ -168,76 +166,106 @@ def _install_responses_cleanup_patch() -> None:
     if getattr(OpenAIClient, "_mirofish_cleanup_patched", False):
         return
 
+    original_create = OpenAIClient._create_structured_completion
+
     async def _patched_create_structured_completion(
         self, model, messages, temperature, max_tokens, response_model,
         reasoning=None, verbosity=None,
     ):
-        import json as _json
-        from types import SimpleNamespace
-
-        is_reasoning_model = (
-            model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
-        )
-        # 用 model_json_schema 构造 json_schema，走 responses.create 的 text.format
-        # （不走 responses.parse 的 post_parser，返回的 response 对象可用）
+        # 优先走原生 responses.parse（网关支持好时最干净）
         try:
-            schema = response_model.model_json_schema()
-        except Exception:
-            schema = {"type": "object"}
+            return await original_create(
+                self, model, messages, temperature, max_tokens, response_model,
+                reasoning, verbosity,
+            )
+        except Exception as parse_error:
+            # 非 ValidationError（如网络错误）直接抛
+            if "ValidationError" not in type(parse_error).__name__:
+                raise
 
-        request_kwargs = {
-            "model": model,
-            "input": messages,
-            "max_output_tokens": max_tokens,
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": getattr(response_model, "__name__", "Response"),
-                        "schema": schema,
-                        "strict": False,
-                    },
-                }
-            },
-        }
-        if temperature is not None and not is_reasoning_model:
-            request_kwargs["temperature"] = temperature
+            # 回退：responses.create + text.format=json_schema + 手动清洗
+            import json as _json
+            from types import SimpleNamespace
 
-        raw = await self.client.responses.create(**request_kwargs)
-        text = getattr(raw, "output_text", None) or ""
-
-        # 清洗网关噪声：剔除 input_schema 等 schema 字段，只留数据
-        cleaned = None
-        if text:
+            is_reasoning_model = (
+                model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
+            )
             try:
-                data = _json.loads(text)
-                if isinstance(data, dict):
+                schema = response_model.model_json_schema()
+            except Exception:
+                schema = {"type": "object"}
+
+            request_kwargs = {
+                "model": model,
+                "input": messages,
+                "max_output_tokens": max_tokens,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": getattr(response_model, "__name__", "Response"),
+                            "schema": schema,
+                            "strict": False,
+                        },
+                    }
+                },
+            }
+            if temperature is not None and not is_reasoning_model:
+                request_kwargs["temperature"] = temperature
+
+            raw = await self.client.responses.create(**request_kwargs)
+            text = getattr(raw, "output_text", None) or ""
+
+            # 清洗网关噪声：递归剔除 schema 字段
+            def _deep_clean(obj):
+                if isinstance(obj, dict):
+                    # 剔除 schema 噪声键
                     for noise_key in ("input_schema", "schema", "json_schema"):
-                        data.pop(noise_key, None)
-                cleaned = data
-            except _json.JSONDecodeError:
-                pass
+                        obj.pop(noise_key, None)
+                    # 剔除值为 schema 描述的噪声字段（含 additionalProperties/type:object/properties）
+                    noise_value_keys = []
+                    for k, v in obj.items():
+                        if isinstance(v, dict) and _is_schema_dict(v):
+                            noise_value_keys.append(k)
+                        else:
+                            _deep_clean(v)
+                    for k in noise_value_keys:
+                        obj.pop(k, None)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        _deep_clean(item)
+                return obj
 
-        # 包装成 graphiti _handle_structured_response 期望的 response 形状：
-        # output_text（清洗后的纯数据 JSON）+ usage
-        cleaned_text = _json.dumps(cleaned) if cleaned is not None else ""
+            def _is_schema_dict(d):
+                """判断 dict 是否是 JSON Schema 描述（而非数据）。"""
+                schema_markers = {"additionalProperties", "properties", "$defs", "$ref", "allOf", "anyOf", "oneOf"}
+                return any(m in d for m in schema_markers) and d.get("type") in ("object", "array", "string", "integer", "boolean", "number")
 
-        # 数据完整性校验：网关偶发只返回 schema 不返回数据，清洗后 dict 可能
-        # 缺 response_model 的必填字段。此时抛异常让 generate_response 重试。
-        if cleaned is not None:
-            try:
-                response_model.model_validate(cleaned)
-            except Exception as ve:
-                raise Exception(
-                    f"网关返回数据不完整（清洗后缺字段），触发重试: {ve}"
-                ) from ve
+            cleaned = None
+            if text:
+                try:
+                    data = _json.loads(text)
+                    cleaned = _deep_clean(data)
+                except _json.JSONDecodeError:
+                    pass
 
-        usage = getattr(raw, "usage", None)
-        return SimpleNamespace(
-            output_text=cleaned_text,
-            usage=usage,
-            refusal=getattr(raw, "refusal", None),
-        )
+            cleaned_text = _json.dumps(cleaned) if cleaned is not None else ""
+
+            # 数据完整性校验：缺字段时抛异常触发 graphiti 重试
+            if cleaned is not None:
+                try:
+                    response_model.model_validate(cleaned)
+                except Exception as ve:
+                    raise Exception(
+                        f"网关返回数据不完整（清洗后缺字段），触发重试: {ve}"
+                    ) from parse_error
+
+            usage = getattr(raw, "usage", None)
+            return SimpleNamespace(
+                output_text=cleaned_text,
+                usage=usage,
+                refusal=getattr(raw, "refusal", None),
+            )
 
     OpenAIClient._create_structured_completion = _patched_create_structured_completion
     OpenAIClient._mirofish_cleanup_patched = True
